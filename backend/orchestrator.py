@@ -1,7 +1,9 @@
 """
 Orchestrator — coordinates intent router + services to produce an answer.
-No Odoo calls. All product data from local Supabase table.
-Includes conversation memory via chat history.
+Optimized for low latency:
+- Smalltalk returns instantly.
+- Inventory/catalog queries return directly without LLM by default.
+- RAG is only used for knowledge-base questions.
 """
 
 import time
@@ -12,34 +14,35 @@ from intent_router import is_smalltalk, classify
 from services import rag, llm, catalog, chat
 
 
-def answer(question: str, session_id: Optional[str] = None, k: int = 4) -> Tuple[str, str, List[dict]]:
+def answer(question: str, session_id: Optional[str] = None, k: int = 3) -> Tuple[str, str, List[dict]]:
     start = time.perf_counter()
+
     lang = detect_lang(question)
     qnorm = normalize_whitespace(question).lower()
 
-    # ── Smalltalk ──
+    # 1. Smalltalk: no database, no LLM.
     if is_smalltalk(qnorm):
         text = llm.format_smalltalk(lang)
         return text, f"{time.perf_counter() - start:.2f}s", []
 
-    # ── Fetch conversation history ──
-    history = chat.fetch_history(session_id, last_n=10)
     intent = classify(question)["intent"]
 
-    # ── Inventory (local search + LLM reasoning + memory) ──
+    # 2. Inventory/catalog: Supabase search only, no LLM.
+    # This is the biggest latency improvement.
     if intent == "inventory":
         t_cat = time.perf_counter()
-        products = catalog.search(question, limit=15)
+        products = catalog.search(question, limit=10)
         catalog_s = time.perf_counter() - t_cat
 
-        t_llm = time.perf_counter()
-        text = llm.generate_inventory_answer(question, products, lang, history=history)
-        llm_s = time.perf_counter() - t_llm
+        text = llm.format_inventory_answer_fast(question, products, lang)
 
         total = time.perf_counter() - start
-        return text, f"{total:.2f}s (Catalog {catalog_s:.3f}s | LLM {llm_s:.2f}s)", []
+        return text, f"{total:.2f}s (Catalog {catalog_s:.3f}s | LLM 0.00s)", []
 
-    # ── RAG / Knowledge (with memory) ──
+    # 3. RAG questions only.
+    # Fetch history only for RAG, not for inventory.
+    history = chat.fetch_history(session_id, last_n=6) if session_id else []
+
     t_rag = time.perf_counter()
     chunks = rag.retrieve_chunks(question, k=k)
     rag_s = time.perf_counter() - t_rag
