@@ -5,3 +5,5 @@ supabase
 langchain-openai
 requests
 python-multipart
+python-dotenv
+pydantic
